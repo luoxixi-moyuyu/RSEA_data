@@ -1,0 +1,110 @@
+# 放到 GitHub 仓库的 .github/workflows/to-zenodo.yml
+# 作用：把 Release 里的 zenodo.zip.partNN 分片拼回一个 zenodo.zip（校验 sha256），
+#       再上传到 Zenodo 草稿（单个文件），全程在 GitHub 机房里完成。
+name: relay-release-to-zenodo
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag"
+        required: true
+        default: "rawdata-v1"
+      record:
+        description: "Zenodo draft id"
+        required: true
+        default: "23264767"
+      prefix:
+        description: "分片名前缀"
+        required: true
+        default: "zenodo.zip.part"
+      filename:
+        description: "拼好后的文件名（也是 Zenodo 上的文件名）"
+        required: true
+        default: "zenodo.zip"
+  release:
+    types: [published]
+
+permissions:
+  contents: write          # 需要读 draft release 的附件
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Download the parts (inside GitHub's network)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          PREFIX: ${{ inputs.prefix || 'zenodo.zip.part' }}
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "${PREFIX}*" --dir parts
+          ls -l parts | head -30
+          echo "parts: $(ls parts | wc -l)"
+
+      - name: Reassemble and verify
+        env:
+          PREFIX: ${{ inputs.prefix || 'zenodo.zip.part' }}
+          FILE: ${{ inputs.filename || 'zenodo.zip' }}
+          EXPECTED_SHA256: "33da5e938ca5fdc65a3b25abaceb3de2266c87efb01de05eea109c99211d19b2"
+        run: |
+          cat $(ls parts/${PREFIX}* | sort) > "$FILE"
+          ls -l "$FILE"
+          ACTUAL=$(sha256sum "$FILE" | cut -d' ' -f1)
+          echo "sha256: $ACTUAL"
+          if [ -n "$EXPECTED_SHA256" ] && [ "$ACTUAL" != "$EXPECTED_SHA256" ]; then
+            echo "::error::sha256 mismatch — 拼装结果不对，停止上传"; exit 1
+          fi
+
+      - name: Upload the single file to Zenodo
+        env:
+          ZENODO_TOKEN: ${{ secrets.ZENODO_TOKEN }}
+          RECORD: ${{ inputs.record || '23264767' }}
+          KEY: ${{ inputs.filename || 'zenodo.zip' }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, time, urllib.request as u
+          TOKEN, REC, KEY = os.environ["ZENODO_TOKEN"], os.environ["RECORD"], os.environ["KEY"]
+          API = "https://zenodo.org/api"
+          path = pathlib.Path(KEY); size = path.stat().st_size
+          print("file: %s  %.2f GB" % (KEY, size / 1e9))
+          def call(method, url, data=None, ctype="application/json", timeout=1800):
+              if not url.startswith("http"): url = API + url
+              req = u.Request(url, data=data, method=method,
+                              headers={"Authorization": "Bearer " + TOKEN, "Content-Type": ctype})
+              with u.urlopen(req, timeout=timeout) as r:
+                  b = r.read(); return json.loads(b) if b else {}
+          def files(): return call("GET", "/records/%s/draft/files" % REC).get("entries", [])
+          for attempt in range(1, 4):
+              try:
+                  for e in files():
+                      if e["key"] == KEY and e.get("size") == size and e.get("status") == "completed":
+                          print("already uploaded, size matches -> nothing to do"); raise SystemExit(0)
+                      if e["key"] == KEY:
+                          print("removing stale entry", e.get("size"), e.get("status"))
+                          call("DELETE", "/records/%s/draft/files/%s" % (REC, KEY))
+                  call("POST", "/records/%s/draft/files" % REC, json.dumps([{"key": KEY, "size": size}]).encode())
+                  print("registered, uploading ..."); t0 = time.time()
+                  with open(KEY, "rb") as fh:
+                      req = u.Request(API + "/records/%s/draft/files/%s/content" % (REC, KEY), data=fh, method="PUT",
+                                      headers={"Authorization": "Bearer " + TOKEN,
+                                               "Content-Type": "application/octet-stream",
+                                               "Content-Length": str(size)})
+                      with u.urlopen(req, timeout=7200) as r: print("upload http", r.status)
+                  info = call("POST", "/records/%s/draft/files/%s/commit" % (REC, KEY))
+                  print("committed after %.1f min: %s" % ((time.time()-t0)/60,
+                        {k: info.get(k) for k in ("key", "size", "checksum")}))
+                  h = hashlib.md5()
+                  with open(KEY, "rb") as fh:
+                      for b in iter(lambda: fh.read(1 << 22), b""): h.update(b)
+                  zen = (info.get("checksum") or "").split(":", 1)[-1]
+                  print("md5 local=%s  zenodo=%s  %s" % (h.hexdigest()[:16], zen[:16],
+                        "OK" if zen == h.hexdigest() else "MISMATCH!"))
+                  print("done: https://zenodo.org/uploads/%s" % REC); break
+              except SystemExit: raise
+              except Exception as exc:
+                  print("attempt %d failed: %s: %s" % (attempt, type(exc).__name__, exc))
+                  if attempt == 3: raise
+                  time.sleep(30)
+          PY
