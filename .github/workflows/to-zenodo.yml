@@ -1,6 +1,7 @@
 # 放到 GitHub 仓库的 .github/workflows/to-zenodo.yml
-# 作用：把 Release 里的 zenodo.zip.partNN 分片拼回一个 zenodo.zip（校验 sha256），
-#       再上传到 Zenodo 草稿（单个文件），全程在 GitHub 机房里完成。
+# 作用：把 Release 里的分片（zenodo.zip.part01-30 + zenodo.zip.tail01-13）
+#       拼回一个 zenodo.zip（校验 sha256），再上传到 Zenodo 草稿（单个文件），
+#       全程在 GitHub 机房里完成。
 name: relay-release-to-zenodo
 
 on:
@@ -14,10 +15,10 @@ on:
         description: "Zenodo draft id"
         required: true
         default: "23264767"
-      prefix:
-        description: "分片名前缀"
+      pattern:
+        description: "分片文件通配符"
         required: true
-        default: "zenodo.zip.part"
+        default: "zenodo.zip.*"
       filename:
         description: "拼好后的文件名（也是 Zenodo 上的文件名）"
         required: true
@@ -37,19 +38,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name || inputs.tag }}
-          PREFIX: ${{ inputs.prefix || 'zenodo.zip.part' }}
+          PATTERN: ${{ inputs.pattern || 'zenodo.zip.*' }}
         run: |
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "${PREFIX}*" --dir parts
-          ls -l parts | head -30
-          echo "parts: $(ls parts | wc -l)"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$PATTERN" --dir parts
+          ls -l parts | head -40
+          echo "parts: $(ls parts | wc -l), total bytes: $(du -sb parts | cut -f1)"
 
       - name: Reassemble and verify
         env:
-          PREFIX: ${{ inputs.prefix || 'zenodo.zip.part' }}
+          PATTERN: ${{ inputs.pattern || 'zenodo.zip.*' }}
           FILE: ${{ inputs.filename || 'zenodo.zip' }}
           EXPECTED_SHA256: "33da5e938ca5fdc65a3b25abaceb3de2266c87efb01de05eea109c99211d19b2"
         run: |
-          cat $(ls parts/${PREFIX}* | sort) > "$FILE"
+          cat $(ls parts/${PATTERN} | sort) > "$FILE"
           ls -l "$FILE"
           ACTUAL=$(sha256sum "$FILE" | cut -d' ' -f1)
           echo "sha256: $ACTUAL"
