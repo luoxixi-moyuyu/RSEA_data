@@ -1,6 +1,11 @@
 # 放到 GitHub 仓库的 .github/workflows/to-zenodo.yml
-# 作用：把 Release 里的分片按 order.txt 拼回一个 zenodo.zip（sha256 校验），
-#       再用 legacy bucket 接口（官方给大文件用的通道，curl 带自动重试）上传到 Zenodo 草稿。
+# 把 Release 里的分片按 order.txt 拼回 zenodo.zip（sha256 校验），
+# 然后把 43 个分片作为 zenodo.zip.001 … .043 传进 Zenodo 草稿（每片 50 MB，
+# 单个请求 ~1 分钟，不会被 Zenodo 网关掐），并附带 README.txt 说明如何合并。
+#
+# 说明：Zenodo 的单文件 PUT 通道实测在 ~8 分钟被网关 504 掐断（新 API 与 legacy bucket 都一样），
+# 所以 2.1 GB 的单文件无法直接从任何地方上传；分片作为独立文件是唯一稳定的方式，
+# 下载方用 7-Zip 打开 zenodo.zip.001 会自动合并（或 cat zenodo.zip.0* > zenodo.zip）。
 name: relay-release-to-zenodo
 
 on:
@@ -19,7 +24,7 @@ on:
         required: true
         default: "zenodo.zip.*"
       filename:
-        description: "拼好后的文件名（也是 Zenodo 上的文件名）"
+        description: "基础文件名"
         required: true
         default: "zenodo.zip"
   release:
@@ -43,7 +48,7 @@ jobs:
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "order.txt" --dir .
           echo "parts: $(ls parts | wc -l), manifest lines: $(wc -l < order.txt)"
 
-      - name: Reassemble and verify
+      - name: Reassemble and verify (proves the 2 GB is intact)
         env:
           FILE: ${{ inputs.filename || 'zenodo.zip' }}
           EXPECTED_SHA256: "33da5e938ca5fdc65a3b25abaceb3de2266c87efb01de05eea109c99211d19b2"
@@ -56,50 +61,92 @@ jobs:
             echo "::error::sha256 mismatch - abort"; exit 1
           fi
 
-      - name: Upload via the legacy bucket endpoint (documented path for big files)
+      - name: Upload zenodo.zip.001 … .043 into the Zenodo draft
         env:
           ZENODO_TOKEN: ${{ secrets.ZENODO_TOKEN }}
           RECORD: ${{ inputs.record || '23264767' }}
-          KEY: ${{ inputs.filename || 'zenodo.zip' }}
+          BASE: ${{ inputs.filename || 'zenodo.zip' }}
         run: |
-          set -e
           python3 - <<'PY'
-          import json, os, urllib.request as u
-          TOKEN, REC, KEY = os.environ["ZENODO_TOKEN"], os.environ["RECORD"], os.environ["KEY"]
+          import json, os, time, urllib.request as u
+
+          TOKEN, REC, BASE = os.environ["ZENODO_TOKEN"], os.environ["RECORD"], os.environ["BASE"]
           API = "https://zenodo.org/api"
 
-          def call(method, path):
-              req = u.Request(API + path, method=method, headers={"Authorization": "Bearer " + TOKEN})
-              with u.urlopen(req, timeout=180) as r:
+          def call(method, path, data=None, ctype="application/json", timeout=600):
+              req = u.Request(API + path, data=data, method=method,
+                              headers={"Authorization": "Bearer " + TOKEN, "Content-Type": ctype})
+              with u.urlopen(req, timeout=timeout) as r:
                   b = r.read()
                   return json.loads(b) if b else {}
 
-          for e in call("GET", "/records/%s/draft/files" % REC).get("entries", []):
-              if e["key"] == KEY:
-                  print("deleting stale entry:", e.get("size"), e.get("status"))
-                  call("DELETE", "/records/%s/draft/files/%s" % (REC, KEY))
+          parts = [l.strip() for l in open("order.txt") if l.strip()]
+          print("manifest: %d parts" % len(parts))
 
-          info = call("GET", "/deposit/depositions/%s" % REC)
-          bucket = info["links"]["bucket"]
-          print("bucket:", bucket)
-          open("bucket.txt", "w").write(bucket)
-          PY
-          BUCKET=$(cat bucket.txt)
-          echo "uploading $(stat -c%s "$KEY") bytes to $BUCKET/$KEY"
-          curl --progress-bar --fail --retry 6 --retry-delay 20 --retry-all-errors \
-               --upload-file "$KEY" \
-               -H "Authorization: Bearer $ZENODO_TOKEN" \
-               -o /dev/null -w "upload http %{http_code}, %{size_upload} bytes, %{speed_upload} B/s\n" \
-               "$BUCKET/$KEY"
-          echo "== files in the draft =="
-          python3 - <<'PY'
-          import json, os, urllib.request as u
-          TOKEN, REC = os.environ["ZENODO_TOKEN"], os.environ["RECORD"]
-          req = u.Request("https://zenodo.org/api/records/%s/draft/files" % REC,
-                          headers={"Authorization": "Bearer " + TOKEN})
-          with u.urlopen(req, timeout=120) as r:
-              data = json.load(r)
-          for e in data.get("entries", []):
+          # 先清掉草稿里旧的同名条目（含之前失败的 zenodo.zip）
+          keep = set("%s.%03d" % (BASE, i + 1) for i in range(len(parts)))
+          for e in call("GET", "/records/%s/draft/files" % REC).get("entries", []):
+              if e["key"] not in keep:
+                  print("  removing old entry:", e["key"], e.get("size"), e.get("status"))
+                  call("DELETE", "/records/%s/draft/files/%s" % (REC, e["key"]))
+
+          have = {e["key"]: e for e in call("GET", "/records/%s/draft/files" % REC).get("entries", [])
+                  if e.get("status") == "completed"}
+
+          readme = ("This record stores the packed raw measurement archive as split files.\n"
+                    "To get the single archive back:\n\n"
+                    "  Windows / 7-Zip : right click %s.001 -> Extract\n"
+                    "  Linux / macOS   : cat %s.0* > %s\n\n"
+                    "After joining, the file must be %d bytes with sha256\n"
+                    "  33da5e938ca5fdc65a3b25abaceb3de2266c87efb01de05eea109c99211d19b2\n"
+                    % (BASE, BASE, BASE, 2105195755))
+          open("README.txt", "w").write(readme)
+
+          todo = [(i + 1, name, "parts/" + name) for i, name in enumerate(parts)]
+          t0 = time.time()
+          for idx, part, path in todo:
+              key = "%s.%03d" % (BASE, idx)
+              size = os.path.getsize(path)
+              e = have.get(key)
+              if e and e.get("size") == size:
+                  print("  %s already there (%d bytes)" % (key, size))
+                  continue
+              if e:
+                  call("DELETE", "/records/%s/draft/files/%s" % (REC, key))
+              call("POST", "/records/%s/draft/files" % REC,
+                   json.dumps([{"key": key, "size": size}]).encode())
+              with open(path, "rb") as fh:
+                  req = u.Request(API + "/records/%s/draft/files/%s/content" % (REC, key), data=fh,
+                                  method="PUT",
+                                  headers={"Authorization": "Bearer " + TOKEN,
+                                           "Content-Type": "application/octet-stream",
+                                           "Content-Length": str(size)})
+                  with u.urlopen(req, timeout=1800) as r:
+                      r.read()
+              call("POST", "/records/%s/draft/files/%s/commit" % (REC, key))
+              print("  %s  %d bytes  ok   (%.1f min elapsed)" % (key, size, (time.time() - t0) / 60), flush=True)
+
+          # README.txt
+          rs = os.path.getsize("README.txt")
+          if "README.txt" not in have:
+              call("POST", "/records/%s/draft/files" % REC, json.dumps([{"key": "README.txt", "size": rs}]).encode())
+              with open("README.txt", "rb") as fh:
+                  req = u.Request(API + "/records/%s/draft/files/README.txt/content" % REC, data=fh,
+                                  method="PUT",
+                                  headers={"Authorization": "Bearer " + TOKEN,
+                                           "Content-Type": "text/plain",
+                                           "Content-Length": str(rs)})
+                  with u.urlopen(req, timeout=300) as r:
+                      r.read()
+              call("POST", "/records/%s/draft/files/README.txt/commit" % REC)
+
+          print("\n== files in the draft ==")
+          total = 0
+          for e in sorted(call("GET", "/records/%s/draft/files" % REC).get("entries", []),
+                          key=lambda x: x["key"]):
               print("   %-28s %12s bytes  %s" % (e["key"], e.get("size"), e.get("status")))
+              if e["key"].startswith(BASE + "."):
+                  total += e.get("size") or 0
+          print("   ---- parts total: %d bytes (expected 2105195755)" % total)
           print("done: https://zenodo.org/uploads/%s" % REC)
           PY
